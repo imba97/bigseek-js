@@ -30,12 +30,9 @@ jobs:
 
       - run: npm i -g npm@latest
 
-      - run: npx changelogithub
-        env:
-          GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
-
       - name: Install Dependencies
-        run: pnpm i --no-frozen-lockfile
+        # 锁文件已提交：发布构建必须可复现，不用 --no-frozen-lockfile
+        run: pnpm i --frozen-lockfile
 
       - name: Typecheck
         run: pnpm run typecheck
@@ -47,4 +44,12 @@ jobs:
         run: pnpm run build
 
       - name: Publish to NPM
-        run: pnpm publish --access public --no-git-checks
+        run: pnpm publish --access public --no-git-checks --provenance
+
+      # changelog 放在发布**之后**：否则测试/构建/发布任一失败都会留下
+      # 「GitHub Release 已建、npm 却没发」的不一致状态。
+      # 固定大版本：带 contents: write 与 id-token: write 的 job 里不该跑未固定版本的代码。
+      - name: Create GitHub Release
+        run: npx changelogithub@15
+        env:
+          GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
