@@ -26,4 +26,12 @@ export interface WasmSearchIndex {
   formatVersion: () => number
   /** `[标签数, 分类数]` */
   facetCounts: () => number[]
+  /**
+   * wasm-bindgen 生成的释放函数。
+   *
+   * 索引占用 wasm 线性内存，而线性内存只增不减；重复 `createIndex()`（HMR、引擎重试、
+   * 同时加载多份索引）时应显式释放。不调用也行——生成的 glue 注册了 FinalizationRegistry，
+   * GC 回收 JS 包装对象时会兜底释放。
+   */
+  free?: () => void
 }

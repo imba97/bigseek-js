@@ -1,7 +1,7 @@
 import type { BackendQuery, SearchBackend } from '../backend'
 import type { SearchHit } from '../types'
-import { miniSearchTokenizer } from '../tokenize'
-import { SEARCH_LIMIT_DEFAULT } from '../types'
+import { miniSearchTokenizer, normalizeForSearch } from '../tokenize'
+import { resolveLimit } from '../types'
 
 /** 回退语料的一条记录（就是博客构建期产出的 `search-full.json` 的元素） */
 export interface MiniSearchRecord {
@@ -126,10 +126,12 @@ function createSearchCorpus(records: MiniSearchRecord[], MiniSearch: new (option
     records.map((record) => {
       docsByPath.set(record.path, record)
 
+      // 分面键用归一化后的名字：与 wasm 侧一致，
+      // 否则 `Vue` 与 `vue` 这类大小写/全角差异会让两个引擎给出不同结果
       for (const tag of record.tags)
-        addToIndex(tagPathIndex, tag, record.path)
+        addToIndex(tagPathIndex, normalizeForSearch(tag), record.path)
       for (const category of record.categories)
-        addToIndex(categoryPathIndex, category, record.path)
+        addToIndex(categoryPathIndex, normalizeForSearch(category), record.path)
 
       return {
         id: record.path,
@@ -149,9 +151,20 @@ function createSearchCorpus(records: MiniSearchRecord[], MiniSearch: new (option
   return { mini, docsByPath, tagPathIndex, categoryPathIndex }
 }
 
+/**
+ * 范围过滤：返回受限文档集合。
+ *
+ * - 没给 tag 也没给 category → `null`（不限定范围）
+ * - 给了但查不到（标签改名/删文后的旧值）→ **空集合**，于是「限定一个不存在的标签」得到
+ *   0 条结果。旧实现在这里返回 `null`，等于把范围静默放宽成全站——而且与 wasm 侧
+ *   （未知标签返回空集）行为相反，两个引擎会对同一个查询给出完全不同的结果。
+ */
 function resolveScopePaths(corpus: SearchCorpus, tag: string | null, category: string | null): Set<string> | null {
-  const tagPaths = tag ? corpus.tagPathIndex.get(tag) : null
-  const categoryPaths = category ? corpus.categoryPathIndex.get(category) : null
+  if (!tag && !category)
+    return null
+
+  const tagPaths = tag ? (corpus.tagPathIndex.get(normalizeForSearch(tag)) ?? new Set<string>()) : null
+  const categoryPaths = category ? (corpus.categoryPathIndex.get(normalizeForSearch(category)) ?? new Set<string>()) : null
 
   if (tagPaths && categoryPaths)
     return intersectPathSets(tagPaths, categoryPaths)
@@ -166,7 +179,8 @@ function searchInCorpus(
 ): SearchHit[] {
   const keywords = query.keywords.trim()
   const scopePaths = resolveScopePaths(corpus, query.tag, query.category)
-  const limit = query.limit || SEARCH_LIMIT_DEFAULT
+  // 与 wasm 路径共用同一份归一化：`limit: 0` / 负数 / 超过上限的解释必须一致
+  const limit = resolveLimit(query.limit)
 
   // 没有关键词时就是「按标签/分类浏览」
   if (!keywords) {

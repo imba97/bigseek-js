@@ -23,7 +23,7 @@ export type {
   SearchQuery,
   WasmSearchHit
 } from './types'
-export { SEARCH_LIMIT_DEFAULT, SEARCH_LIMIT_MAX, SUPPORTED_FORMAT_VERSION } from './types'
+export { resolveLimit, SEARCH_LIMIT_DEFAULT, SEARCH_LIMIT_MAX, SUPPORTED_FORMAT_VERSION } from './types'
 export type { WasmSearchIndex, WasmSearchModule } from './wasm/glue'
 
 // 直接在主线程用（不用 Worker）
@@ -41,7 +41,9 @@ export type {
   PreloadMessage,
   QueryMessage,
   ReadyMessage,
+  ReloadMessage,
   ResultMessage,
   SearchRequestMessage,
   SearchResponseMessage
 } from './worker/protocol'
+export { PROTOCOL_VERSION } from './worker/protocol'

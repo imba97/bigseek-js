@@ -32,3 +32,15 @@ export const SEARCH_LIMIT_MAX = 200
 
 /** 生效的检索引擎 */
 export type SearchEngineKind = 'wasm' | 'minisearch'
+
+/**
+ * 归一 `limit`：`0` / `undefined` / `null` / `NaN` 取默认值，其余夹到 `[1, SEARCH_LIMIT_MAX]`。
+ *
+ * 三个调用点（client 发消息前、wasm 查询、回退查询）必须共用这一份实现，
+ * 否则两个引擎对 `limit: 1000` / `limit: 0` 的解释不一致（`slice(0, -1)` 这类边界更隐蔽）。
+ */
+export function resolveLimit(limit?: number | null): number {
+  if (limit === undefined || limit === null || Number.isNaN(limit))
+    return SEARCH_LIMIT_DEFAULT
+  return Math.max(1, Math.min(SEARCH_LIMIT_MAX, Math.floor(limit)))
+}

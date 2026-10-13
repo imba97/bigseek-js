@@ -2,6 +2,7 @@ import type { BackendQuery, SearchBackend } from '../backend'
 import type { CreateIndexOptions } from '../wasm/index'
 import type { QueryMessage, SearchRequestMessage, SearchResponseMessage } from './protocol'
 import { createIndex } from '../wasm/index'
+import { PROTOCOL_VERSION } from './protocol'
 
 /** Worker 侧最小作用域：真 Worker 的 `self`、测试里的假对象都能满足 */
 export interface SearchWorkerScope {
@@ -18,7 +19,7 @@ export interface ServeSearchOptions {
   engine?: 'auto' | 'wasm' | 'minisearch'
   /** 接收消息的作用域，默认 `globalThis`（Worker 里即 `self`） */
   scope?: SearchWorkerScope
-  /** 日志出口，默认 console.warn */
+  /** 日志出口，默认静默 */
   log?: (message: string, ...args: unknown[]) => void
 }
 
@@ -35,6 +36,9 @@ class SearchHost {
   private backend: SearchBackend | null = null
   private stats: Record<string, number> = {}
   private initTask: Promise<void> | null = null
+  /** 初始化失败过：不再每次查询都重来一遍，必须显式 `reload` */
+  private initFailed = false
+  private initErrorMessage: string | null = null
 
   // latest-wins：同一帧内只把最后一个请求的结果发回去
   private queued: QueryMessage | null = null
@@ -50,9 +54,29 @@ class SearchHost {
     if (!raw || typeof raw !== 'object')
       return
     const message = raw as SearchRequestMessage
+    // 版本握手：旧 Worker chunk 与新版主线程混用时直接拒绝，而不是沉默
+    if (message.v !== PROTOCOL_VERSION) {
+      this.emit({
+        type: 'error',
+        v: PROTOCOL_VERSION,
+        message: `搜索 Worker 协议版本不匹配：收到 v${message.v}，本 Worker 是 v${PROTOCOL_VERSION}`
+      })
+      return
+    }
 
     if (message.type === 'preload') {
       void this.ensureBackend()
+      return
+    }
+
+    if (message.type === 'reload') {
+      this.backend = null
+      this.initTask = null
+      this.initFailed = false
+      this.initErrorMessage = null
+      this.stats = {}
+      this.log('[bigseek] reload：丢弃当前引擎并重新加载')
+      void this.ensureBackend(true)
       return
     }
 
@@ -63,8 +87,7 @@ class SearchHost {
   }
 
   private log(message: string, ...args: unknown[]): void {
-    if (this.options.log)
-      this.options.log(message, ...args)
+    this.options.log?.(message, ...args)
   }
 
   private async buildWasm(): Promise<SearchBackend | null> {
@@ -106,26 +129,40 @@ class SearchHost {
     return await this.buildFallback()
   }
 
-  private ensureBackend(): Promise<void> {
+  /**
+   * 确保后端可用。
+   *
+   * 失败后**不自动重试**：否则每个按键都会重新拉一遍 wasm 三件套或整份
+   * `search-full.json` 并重建回退索引（后者是几百毫秒 + MB 级流量），
+   * 同时每条错误还会再通知一次主线程。重试只走显式 `reload`。
+   */
+  private ensureBackend(force = false): Promise<void> {
     if (this.backend)
       return Promise.resolve()
-    if (this.initTask)
+    if (this.initTask && !force)
       return this.initTask
+    if (this.initFailed && !force)
+      return Promise.resolve()
 
     this.initTask = (async () => {
       try {
         this.backend = await this.createBackend()
+        this.initFailed = false
+        this.initErrorMessage = null
         this.emit({
           type: 'ready',
+          v: PROTOCOL_VERSION,
           engine: this.backend.engine,
           stats: this.stats
         })
       }
       catch (error) {
-        this.initTask = null
+        this.initFailed = true
+        this.initErrorMessage = error instanceof Error ? error.message : String(error)
         this.emit({
           type: 'error',
-          message: error instanceof Error ? error.message : String(error)
+          v: PROTOCOL_VERSION,
+          message: this.initErrorMessage
         })
       }
     })()
@@ -142,6 +179,25 @@ class SearchHost {
     queueMicrotask(() => this.flush())
   }
 
+  private searchOne(query: QueryMessage): ReturnType<SearchBackend['search']> {
+    if (!this.backend)
+      return []
+    try {
+      return this.backend.search({
+        keywords: query.keywords,
+        tag: query.tag,
+        category: query.category,
+        limit: query.limit
+      })
+    }
+    catch (error) {
+      // 后端查询抛异常（wasm 里 Rust panic 会变成 RuntimeError）时绝不能让它逃出
+      // microtask：那会让这个 requestId 永远不回包，主线程的 Promise 永久挂起
+      this.log('[bigseek] 查询失败，本轮返回空结果：', error)
+      return []
+    }
+  }
+
   private flush(): void {
     this.flushScheduled = false
     if (this.flushRunning)
@@ -153,20 +209,13 @@ class SearchHost {
         const current = this.queued
         this.queued = null
 
-        const hits = this.backend
-          ? this.backend.search({
-              keywords: current.keywords,
-              tag: current.tag,
-              category: current.category,
-              limit: current.limit
-            })
-          : []
+        const hits = this.searchOne(current)
 
         // 期间又来了更新的请求：这次结果已经过期，丢弃（主线程也是 latest-wins）
         if (this.queued)
           continue
 
-        this.emit({ type: 'searchResult', hits, requestId: current.requestId })
+        this.emit({ type: 'searchResult', v: PROTOCOL_VERSION, hits, requestId: current.requestId })
       }
     }
     finally {

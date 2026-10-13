@@ -1,6 +1,6 @@
 import type { SearchHit, SearchQuery, WasmSearchHit } from '../types'
 import type { WasmSearchIndex, WasmSearchModule } from './glue'
-import { SEARCH_LIMIT_DEFAULT, SEARCH_LIMIT_MAX, SUPPORTED_FORMAT_VERSION } from '../types'
+import { resolveLimit, SUPPORTED_FORMAT_VERSION } from '../types'
 
 export interface CreateIndexOptions {
   /** wasm-bindgen glue（`bigseek.js`）地址 */
@@ -27,17 +27,15 @@ export interface BigseekIndex {
   /** `[标签数, 分类数]` */
   readonly facetCounts: number[]
   query: (query: SearchQuery) => SearchHit[]
+  /**
+   * 释放 wasm 侧索引。索引占的线性内存不会自动归还，重复创建索引时（HMR、引擎重试）
+   * 应当调用；不调用也有 FinalizationRegistry 兜底。释放后本对象不可再用。
+   */
+  dispose: () => void
   /** 底层 wasm 索引句柄（逃生口，一般不需要） */
   readonly raw: WasmSearchIndex
 }
 
-function clampLimit(limit?: number): number {
-  if (limit === undefined || limit === null || Number.isNaN(limit))
-    return SEARCH_LIMIT_DEFAULT
-  return Math.max(1, Math.min(SEARCH_LIMIT_MAX, Math.floor(limit)))
-}
-
-/** 运行时动态 import glue；`@vite-ignore` 阻止打包器分析这个运行时拼出的 URL */
 async function defaultLoadGlue(url: string): Promise<WasmSearchModule> {
   return (await import(/* @vite-ignore */ url)) as WasmSearchModule
 }
@@ -60,9 +58,9 @@ export function toSearchHit(hit: WasmSearchHit): SearchHit {
     title: hit.title,
     date: hit.date,
     snippet: hit.snippet,
-    // wasm 侧返回的是跨边界视图，复制成普通数组避免持有引用
-    tags: [...hit.tags],
-    categories: [...hit.categories]
+    // wasm 侧每次调用都新建数组（`string_array`），这里无需再复制一层
+    tags: hit.tags,
+    categories: hit.categories
   }
 }
 
@@ -104,9 +102,17 @@ export async function createIndex(options: CreateIndexOptions): Promise<BigseekI
         query.keywords,
         query.tag ?? null,
         query.category ?? null,
-        clampLimit(query.limit)
+        resolveLimit(query.limit)
       )
       return hits.map(toSearchHit)
+    },
+    dispose: () => {
+      try {
+        raw.free?.()
+      }
+      catch {
+        // 已经释放过：忽略
+      }
     },
     raw
   }

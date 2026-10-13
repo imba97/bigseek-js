@@ -1,6 +1,7 @@
 import type { SearchEngineKind, SearchHit, SearchQuery } from '../types'
 import type { QueryMessage, SearchRequestMessage, SearchResponseMessage } from './protocol'
-import { SEARCH_LIMIT_DEFAULT } from '../types'
+import { resolveLimit } from '../types'
+import { PROTOCOL_VERSION } from './protocol'
 
 /**
  * Worker 的最小接口。真 `Worker` 满足它；测试里给个假对象也能跑。
@@ -21,6 +22,10 @@ export interface SearchClientState {
   error: string | null
   engine: SearchEngineKind | null
   stats: Record<string, number> | null
+  /** 已 `dispose()`：之后所有查询都安全空转 */
+  disposed: boolean
+  /** Worker 出现致命错误（崩溃 / 消息格式错误 / 协议不匹配）：不会再自动重建 */
+  failed: boolean
 }
 
 export interface CreateSearchClientOptions {
@@ -35,28 +40,41 @@ export interface CreateSearchClientOptions {
   worker: WorkerLike | (() => WorkerLike | null)
   /** 构造后立刻预加载（默认 false：等第一次 `ensureReady()` 或 `search()`） */
   preload?: boolean
+  /**
+   * 单次查询的超时（毫秒，默认 10000；传 0 关闭）。
+   *
+   * Worker 被外部 terminate、被浏览器 OOM 杀掉（不触发 error 事件）、或卡在加载大索引上时，
+   * 没有任何回包，`search()` 会永远挂着。超时后返回空数组并打印日志。
+   */
+  timeoutMs?: number
   /** 打印引擎与错误信息，默认 false */
   debug?: boolean
   log?: (message: string, ...args: unknown[]) => void
 }
 
 export interface SearchClient {
-  /** 只读状态快照；变化通过 `subscribe` 通知（Vue 侧包一层 ref 即可） */
+  /** 只读状态快照；变化通过 `subscribe` 通知（每次通知都是新对象，可直接喂给 ref） */
   readonly state: SearchClientState
-  /** 预加载并等待就绪；可重复 await */
+  /** 预加载并等待就绪；可重复 await。Worker 致命错误后以该错误 reject */
   ensureReady: () => Promise<void>
   /** 查询；同一时刻只认最后一次调用的结果，过期的 Promise 以空数组结束 */
   search: (query: SearchQuery) => Promise<SearchHit[]>
+  /** 丢弃当前引擎并重新加载（引擎初始化失败后的显式重试） */
+  reload: () => Promise<void>
   subscribe: (listener: (state: SearchClientState) => void) => () => void
   dispose: () => void
 }
 
+const DEFAULT_TIMEOUT_MS = 10_000
+
 class SearchClientImpl implements SearchClient {
-  readonly state: SearchClientState = {
+  private currentState: SearchClientState = {
     ready: false,
     error: null,
     engine: null,
-    stats: null
+    stats: null,
+    disposed: false,
+    failed: false
   }
 
   private worker: WorkerLike | null = null
@@ -70,7 +88,12 @@ class SearchClientImpl implements SearchClient {
 
   constructor(private readonly options: CreateSearchClientOptions) {
     if (options.preload)
-      void this.ensureReady()
+      void this.ensureReady().catch(() => {})
+  }
+
+  /** 只读快照：每次通知都会换一个新对象，避免基于引用比较的响应式系统静默失效 */
+  get state(): SearchClientState {
+    return this.currentState
   }
 
   private log(message: string, ...args: unknown[]): void {
@@ -82,7 +105,12 @@ class SearchClientImpl implements SearchClient {
 
   private notify(): void {
     for (const listener of this.listeners)
-      listener(this.state)
+      listener(this.currentState)
+  }
+
+  private patchState(patch: Partial<SearchClientState>): void {
+    this.currentState = { ...this.currentState, ...patch }
+    this.notify()
   }
 
   subscribe(listener: (state: SearchClientState) => void): () => void {
@@ -93,7 +121,13 @@ class SearchClientImpl implements SearchClient {
   }
 
   ensureReady(): Promise<void> {
-    if (this.state.ready)
+    if (this.currentState.disposed)
+      return Promise.resolve()
+    if (this.currentState.failed) {
+      // 致命错误后不再自动重建：明确 reject，调用方才能区分「就绪」与「已死」
+      return Promise.reject(new Error(this.currentState.error ?? '搜索 Worker 已不可用'))
+    }
+    if (this.currentState.ready)
       return Promise.resolve()
     if (this.readyTask)
       return this.readyTask
@@ -102,13 +136,13 @@ class SearchClientImpl implements SearchClient {
     if (!worker)
       return Promise.resolve()
 
-    this.state.error = null
+    this.currentState = { ...this.currentState, error: null }
     this.readyTask = new Promise<void>((resolve, reject) => {
       this.readyTaskResolve = resolve
       this.readyTaskReject = reject
     })
 
-    const message: SearchRequestMessage = { type: 'preload' }
+    const message: SearchRequestMessage = { type: 'preload', v: PROTOCOL_VERSION }
     worker.postMessage(message)
     return this.readyTask
   }
@@ -123,25 +157,76 @@ class SearchClientImpl implements SearchClient {
     const requestId = ++this.searchRequestId
     const message: QueryMessage = {
       type: 'search',
+      v: PROTOCOL_VERSION,
       keywords: query.keywords,
       tag: query.tag ?? null,
       category: query.category ?? null,
-      limit: query.limit ?? SEARCH_LIMIT_DEFAULT,
+      limit: resolveLimit(query.limit),
       requestId
     }
+
+    const timeoutMs = this.options.timeoutMs ?? DEFAULT_TIMEOUT_MS
 
     return new Promise<SearchHit[]>((resolve) => {
       // 上一个还没回来的查询已经过期，直接以空数组结束，避免它悬着
       this.resolvePendingWithEmpty()
-      this.pendingLatest = { requestId, resolve }
+
+      const timer = timeoutMs > 0
+        ? setTimeout(() => {
+            if (this.pendingLatest?.requestId !== requestId)
+              return
+            this.pendingLatest = null
+            this.log(`[bigseek] 查询超时（${timeoutMs}ms），本轮返回空结果`)
+            resolve([])
+          }, timeoutMs)
+        : null
+
+      this.pendingLatest = {
+        requestId,
+        resolve: (hits) => {
+          if (timer)
+            clearTimeout(timer)
+          resolve(hits)
+        }
+      }
       worker.postMessage(message)
     })
   }
 
+  async reload(): Promise<void> {
+    if (this.currentState.disposed)
+      return
+
+    // 重置状态后重新握手：对应 Worker 侧「丢弃后端 + 重新加载」
+    this.patchState({ ready: false, error: null, engine: null, stats: null, failed: false })
+    this.clearReadyTaskReferences()
+    this.readyTaskReject = null
+
+    const worker = this.getWorker()
+    if (!worker)
+      return
+
+    this.readyTask = new Promise<void>((resolve, reject) => {
+      this.readyTaskResolve = resolve
+      this.readyTaskReject = reject
+    })
+    const message: SearchRequestMessage = { type: 'reload', v: PROTOCOL_VERSION }
+    worker.postMessage(message)
+    return this.readyTask
+  }
+
   dispose(): void {
+    if (this.currentState.disposed)
+      return
+
     this.resolvePendingWithEmpty()
+    // 结算未完成的 readyTask：resolve 而不是 reject，
+    // 否则 `void ensureReady()` 这类调用会变成 unhandled rejection
+    this.readyTaskResolve?.()
+    this.clearReadyTaskReferences()
     this.detachWorker()
     this.listeners.clear()
+    this.currentState = { ...this.currentState, ready: false, disposed: true }
   }
 
   private getWorker(): WorkerLike | null {
@@ -208,11 +293,22 @@ class SearchClientImpl implements SearchClient {
       return
     const message = data as SearchResponseMessage
 
+    if (message.v !== PROTOCOL_VERSION) {
+      this.handleFatal(
+        `搜索 Worker 协议版本不匹配：收到 v${message.v}，本客户端是 v${PROTOCOL_VERSION}`
+      )
+      return
+    }
+
     if (message.type === 'ready') {
-      this.state.ready = true
-      this.state.error = null
-      this.state.engine = message.engine
-      this.state.stats = message.stats ?? null
+      this.currentState = {
+        ...this.currentState,
+        ready: true,
+        error: null,
+        engine: message.engine,
+        stats: message.stats ?? null,
+        failed: false
+      }
       this.notify()
       this.log(`[bigseek] 引擎就绪：${message.engine}`)
       this.resolveReadyTask()
@@ -234,8 +330,7 @@ class SearchClientImpl implements SearchClient {
   }
 
   private handleErrorMessage(message: string): void {
-    this.state.error = message
-    this.state.ready = false
+    this.currentState = { ...this.currentState, error: message, ready: false }
     this.notify()
     this.log(`[bigseek] ${message}`)
     this.readyTaskReject?.(new Error(message))
@@ -245,6 +340,8 @@ class SearchClientImpl implements SearchClient {
 
   private handleFatal(message: string): void {
     this.handleErrorMessage(message)
+    this.currentState = { ...this.currentState, failed: true }
+    this.notify()
     this.detachWorker()
   }
 
