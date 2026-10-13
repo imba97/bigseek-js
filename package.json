@@ -1,0 +1,63 @@
+{
+  "name": "bigseek",
+  "type": "module",
+  "version": "0.1.0",
+  "packageManager": "pnpm@10.33.0",
+  "description": "Browser client for bigseek indexes: WebAssembly query engine, CJK bigram tokenizer and optional MiniSearch fallback",
+  "author": "imba97",
+  "license": "MIT",
+  "homepage": "https://github.com/imba97/bigseek-js#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/imba97/bigseek-js.git"
+  },
+  "bugs": {
+    "url": "https://github.com/imba97/bigseek-js/issues"
+  },
+  "keywords": [
+    "search",
+    "wasm",
+    "cjk",
+    "bigram",
+    "index",
+    "bigseek"
+  ],
+  "main": "dist/index.mjs",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20.12.0"
+  },
+  "scripts": {
+    "build": "unbuild",
+    "stub": "unbuild --stub",
+    "test": "vitest --run",
+    "lint": "eslint --cache .",
+    "typecheck": "tsc --noEmit",
+    "release": "bumpp",
+    "prepare": "simple-git-hooks"
+  },
+  "dependencies": {
+    "minisearch": "^7.2.0"
+  },
+  "devDependencies": {
+    "@antfu/eslint-config": "^8.0.0",
+    "@types/node": "^25.5.0",
+    "bumpp": "^11.0.1",
+    "eslint": "^10.1.0",
+    "nano-staged": "^1.0.2",
+    "simple-git-hooks": "^2.13.1",
+    "typescript": "^6.0.2",
+    "unbuild": "^3.6.1",
+    "vitest": "^5.0.4"
+  },
+  "simple-git-hooks": {
+    "pre-commit": "pnpm exec nano-staged"
+  },
+  "nano-staged": {
+    "*.{js,cjs,mjs,ts,cts,mts,json,md,yml,yaml}": "eslint --cache --fix"
+  }
+}
