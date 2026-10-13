@@ -1,10 +1,14 @@
-node_modules
-.vscode
-.idea
-.dist
-coverage
-dist
-*.log
+.DS_Store
+._*
+.cache
+.project
+.settings
+.tmproj
 
-# eslint
+.svn
+.idea
+.history
+node_modules
+dist
+
 .eslintcache

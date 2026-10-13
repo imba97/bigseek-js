@@ -1,6 +1,13 @@
-shellEmulator: true
+minimumReleaseAgeExcludePrune: true
+minimumReleaseAgeExclude:
+  - '@vue/compiler-core@3.5.44'
+  - '@vue/compiler-dom@3.5.44'
+  - '@vue/compiler-sfc@3.5.44'
+  - '@vue/compiler-ssr@3.5.44'
+  - '@vue/shared@3.5.44'
 
 trustPolicy: no-downgrade
+shellEmulator: true
 
 allowBuilds:
   esbuild: true
