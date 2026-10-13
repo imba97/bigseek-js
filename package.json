@@ -1,7 +1,7 @@
 {
   "name": "bigseek",
   "type": "module",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "packageManager": "pnpm@12.11.2",
   "description": "Browser client for bigseek indexes: WebAssembly query engine, CJK bigram tokenizer and optional MiniSearch fallback",
   "author": "imba97",
